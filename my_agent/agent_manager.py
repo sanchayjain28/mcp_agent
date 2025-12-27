@@ -1,18 +1,23 @@
 """Shared agent manager for initializing and managing the MCP client and agent."""
-import asyncio
 import os
 import shutil
 from pathlib import Path
-from typing import Optional
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain.agents import create_agent
+from logger import logger
+from dotenv import load_dotenv
 
-# Get Bright Data API token from environment variable
-BRIGHT_DATA_API_KEY = os.getenv("BRIGHT_DATA_API_TOKEN", "937673d6077325f58c265d5e0e4fc28dfebbfb44afad624d3c87b724f34b3afe")
+load_dotenv()
+
+BRIGHT_DATA_API_KEY = os.getenv("BRIGHT_DATA_API_TOKEN")
+if not BRIGHT_DATA_API_KEY:
+    raise ValueError("BRIGHT_DATA_API_TOKEN is not set")
+
 # Global variables for agent and client
 _agent = None
 _client = None
 _initialized = False
+
 
 async def initialize_agent(model: str = "gpt-5-nano"):
     """Initialize the MCP client and agent."""
@@ -21,30 +26,23 @@ async def initialize_agent(model: str = "gpt-5-nano"):
     if _initialized:
         return _agent, _client
     
-    # Get absolute path to the MCP server script
     server_script_path = Path(__file__).parent / "role_search_server.py"
     
-    # Build server configuration dictionary
     servers_config = {
         "role_search": {
-            "transport": "stdio",  # Local subprocess communication
+            "transport": "stdio", 
             "command": "python",
-            # Absolute path to your role_search_server.py file
             "args": [str(server_script_path)],
         }
     }
     
-    # Add Bright Data server only if npx and node are available
-    # Check for npx in PATH first, then check common nvm locations
     npx_path = shutil.which("npx")
     node_path = shutil.which("node")
     node_bin_dir = None
     
     if not npx_path or not node_path:
-        # Check nvm directory if not in PATH
         nvm_node = Path.home() / ".nvm" / "versions" / "node"
         if nvm_node.exists():
-            # Find the latest node version
             node_versions = sorted([d for d in nvm_node.iterdir() if d.is_dir()], reverse=True)
             if node_versions:
                 node_bin_dir = node_versions[0] / "bin"
@@ -54,44 +52,111 @@ async def initialize_agent(model: str = "gpt-5-nano"):
                     node_path = str(node_bin_dir / "node")
                     node_bin_dir = str(node_bin_dir)
     
-    if npx_path and node_path:
-        # Get the node bin directory for PATH
-        if not node_bin_dir:
-            node_bin_dir = str(Path(node_path).parent)
+
+    # Check for Memora server
+    memora_path = shutil.which("memora-server")
+    try:
+        memora_env = os.environ.copy()
+        # Set default database path if not already set
+        if "MEMORA_DB_PATH" not in memora_env:
+            memora_db_path = Path.home() / ".local" / "share" / "memora" / "memories.db"
+            memora_db_path.parent.mkdir(parents=True, exist_ok=True)
+            memora_env["MEMORA_DB_PATH"] = str(memora_db_path)
+        # Enable graph server on default port if not set
+        if "MEMORA_GRAPH_PORT" not in memora_env:
+            memora_env["MEMORA_GRAPH_PORT"] = "8765"
+        # Allow any tags by default
+        if "MEMORA_ALLOW_ANY_TAG" not in memora_env:
+            memora_env["MEMORA_ALLOW_ANY_TAG"] = "1"
         
-        # Get current environment and add node bin to PATH
-        env = os.environ.copy()
-        current_path = env.get("PATH", "")
-        if node_bin_dir not in current_path:
-            env["PATH"] = f"{node_bin_dir}:{current_path}"
+        memora_abs_path = str(Path(memora_path).resolve())
         
-        # Add Bright Data API token
-        env["API_TOKEN"] = BRIGHT_DATA_API_KEY
-        
-        servers_config["Bright Data"] = {
+        servers_config["memora"] = {
             "transport": "stdio",
-            "command": npx_path,
-            "args": ["@brightdata/mcp"],
-            "env": env
+            "command": memora_abs_path,
+            "args": [],
+            "env": memora_env
         }
-        print(f"Bright Data MCP server will be initialized (npx: {npx_path}, node: {node_path})")
+        logger.info(f"Memora MCP server will be initialized (path: {memora_path}, db: {memora_env.get('MEMORA_DB_PATH')})")
+    except Exception as e:
+        logger.warning(f"Error initializing Memora MCP server: {e}")
+        logger.warning("Continuing without Memora server...")
     else:
-        print("Warning: npx or node not found. Bright Data MCP server will not be available.")
-        print("To enable Bright Data, install Node.js/npm which includes npx and node.")
+        logger.info("Warning: memora-server not found. Memora MCP server will not be available.")
+        logger.info("To enable Memora, install it via: pip install git+https://github.com/agentic-mcp-tools/memora.git")
     
-    # Create MCP client with available servers
+    # Check for Bright Data server (requires Node.js/npm)
+    if npx_path and node_path:
+        try:
+            if not node_bin_dir:
+                node_bin_dir = str(Path(node_path).parent)
+            
+            env = os.environ.copy()
+            # Ensure Node.js bin directory is in PATH
+            current_path = env.get("PATH", "")
+            if node_bin_dir and node_bin_dir not in current_path:
+                env["PATH"] = f"{node_bin_dir}:{current_path}"
+            
+            env["API_TOKEN"] = BRIGHT_DATA_API_KEY
+            
+            # Use absolute path to npx to ensure it's found
+            npx_abs_path = str(Path(npx_path).resolve())
+            
+            servers_config["Bright Data"] = {
+                "transport": "stdio",
+                "command": npx_abs_path,
+                "args": ["@brightdata/mcp"],
+                "env": env
+            }
+            logger.info(f"Bright Data MCP server will be initialized (npx: {npx_path}, node: {node_path})")
+        except Exception as e:
+            logger.warning(f"Error initializing Bright Data MCP server: {e}")
+            logger.warning("Continuing without Bright Data server...")
+    else:
+        logger.info("Warning: npx or node not found. Bright Data MCP server will not be available.")
+        logger.info("To enable Bright Data:")
+        logger.info("  1. Install Node.js (v20+): https://nodejs.org/")
+        logger.info("     Or use nvm: curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash")
+        logger.info("  2. Install the Bright Data MCP package: npx @brightdata/mcp")
+    
     _client = MultiServerMCPClient(servers_config)
     
-    # Get tools from MCP server
-    print("Connecting to MCP server and loading tools...")
-    tools = await _client.get_tools()
-    print(f"Loaded {len(tools)} tools: {[tool.name for tool in tools]}\n")
+    try:
+        logger.info(f"Initializing {len(servers_config)} MCP server(s): {list(servers_config.keys())}")
+        tools = await _client.get_tools()
+        logger.info(f"Successfully loaded {len(tools)} tool(s) from all servers")
+
+        tool_names = [tool.name for tool in tools]
+        logger.info(f"Available tools: {', '.join(tool_names)}")
+        
+    except Exception as e:
+        logger.error(f"Error getting tools from MCP servers: {e}")
+        logger.error(f"Server config: {servers_config}")
+
+        if len(servers_config) > 1:
+            logger.warning("One or more servers failed. Testing servers individually...")
+
+            other_servers = {k: v for k, v in servers_config.items() if k != "role_search"}
+            working_servers = {"role_search": servers_config["role_search"]}
+            
+            for server_name, server_config in other_servers.items():
+                try:
+                    logger.info(f"Testing {server_name} server...")
+                    test_config = {server_name: server_config}
+                    test_client = MultiServerMCPClient(test_config)
+                    test_tools = await test_client.get_tools()
+                    logger.info(f"✓ {server_name} server OK - {len(test_tools)} tools")
+                    working_servers[server_name] = server_config
+                except Exception as server_error:
+                    logger.warning(f"✗ {server_name} server failed: {server_error}")
+                    logger.warning(f"  Continuing without {server_name} server...")
+        else:
+            raise
     
-    # Create agent with tools
     _agent = create_agent(model, tools)
     
     _initialized = True
-    print("Agent initialized successfully!")
+    logger.info("Agent initialized successfully!")
     
     return _agent, _client
 
